@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Network Performance Tuning</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+
+      .remark-inline-code {
+        padding: 1px!important;
+        padding-left: 3px!important;
+        padding-right: 3px!important;
+        border-radius: 3px!important;
+        border: 1px solid #ccc!important;
+      }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+class: center, middle
+
+# Network Performance Tuning
+
+Jamie Bainbridge  
+ 
+Senior Software Maintenance Engineer  
+
+Red Hat, Inc.  
+
+---
+
+# This Talk
+
+* These notes at: <http://jbainbri.github.io>
+
+* Target audience
+
+    * High-speed low-latency LANs - 1/10/40Gbps
+
+    * Not LFNs like WANs, not internet
+
+    * Normal everyday sysadmins with real applications to run
+
+* Based on work done by Jon Maxwell, Principal SME, and myself
+
+---
+
+# Agenda
+
+* Performance Tuning Do's and Don'ts
+* How Packet Receive Works
+* Understanding NUMA
+* Bottlenecks - locating, identifying, fixing
+    * NIC Receive
+    * Protocol Layers
+    * Application
+
+---
+
+# General Performance Tuning Do's
+
+* Define a clear aim
+    * So you have a point to stop tuning
+
+* Define metrics you care about
+    * Speed, latency, TPS
+
+* Get configuration right and "working" before tuning
+    * Otherwise you end up tuning again
+
+* Test with repeatable production data or production-like workload
+
+* Record EVERY change you make and its results
+
+---
+
+# General Performance Tuning Dos
+
+Recording changes
+
+```
+tried different kernels:
+
+ --------------------------------- ----------- ---------- 
+| Kernel                          | WRITE     | READ     |
+ --------------------------------- ----------- ----------
+| 2.6.32-220                      | 100M/sec  | 100M/sec |
+| 2.6.32-279                      | 110M/sec  | 110M/sec |
+ --------------------------------- ----------- ---------- 
+
+changed mount option:
+
+ ---------------- -------- ------- ----------- ---------- 
+| Kernel         | rsize  | wsize | WRITE     | READ     |
+ ---------------- -------- ------- ----------- ---------- 
+| 2.6.32-220     | 128k   | 128k  | 100M/sec  | 100M/sec |
+| 2.6.32-279     | 128k   | 128k  | 110M/sec  | 110M/sec |
+| 2.6.32-279     | 1M     | 1M    | 120M/sec  | 120M/sec |
+ ---------------- -------- ------- ----------- ---------- 
+```
+
+---
+
+# General Performance Tuning Don'ts
+
+* Don't cargo cult configurations
+    * Understand what you are changing
+    * What works for someone else might not work for you
+    * Many configs on the internet are up to a decade old
+    * Some are just plain wrong, including vendor recommendations
+
+* Don't rely solely on benchmark tools
+    * Treat them as a baseline for the network, not for end hosts
+    * Getting max bandwidth in `iperf` is not your production deliverable
+
+---
+
+# How Receive Works
+
+```
+ NIC                    Kernel            Protocols           To App
++---+----------+       +---------+       +-----------+       +--------+
+| P |  (    )  | ----> | SoftIRQ | ----> | Ethernet  | ----> | Socket |
+| H | ( ring ) |       +---------+       |           |       | Buffer |
+| Y |  (    )  |       |         |       | IP / ICMP |       +--------+
++---+----------+       | Backlog |       |           |
+                       | (maybe) |       | TCP / UDP |                 
+                       |         |       | SCTP      |                 
+                       +---------+       +-----------+                 
+```
+
+* Packet arrives in **Ring Buffer**
+* NIC **Hard Interrupts**, stops a running process, context switches (yuck)
+* Kernel runs an **Interrupt Handler** to turn the interrupt off
+* Kernel schedules a **SoftIRQ** to do the actual receive work  
+  (visible as `ksoftirqd/X` or `%sys` CPU usage)
+* SoftIRQ process runs traffic thru **Protocol Handlers**
+* Data payload is placed in **Socket Buffers** for apps to `recv()`
+* SoftIRQ continues to do **NAPI Polling** until quiet
+* (backlog) *only for virtual devices, RPS, ancient pre-NAPI drivers*
+
+---
+
+# Understanding NUMA
+
+*   Old thinking:  
+    *"one big computer"*
+
+```
+    .--------.   .--------.
+    | CPU(s) +---+ Memory |
+    '--------'   '--------'
+```
+
+*   NUMA thinking:  
+    *"multiple smaller computers sharing a common operating system"*
+
+```
+    .--------.   .--------.        .--------.        .--------.
+    | Node 0 +---+ Node 1 |        | Node 0 +--------+ Node 1 |
+    '-+------+   +------+-'        '-+------'        '------+-'
+      |       \ /       |            |                      |
+      |        X        |            |                      |
+      |       / \       |            |                      |
+    .-+------+   +------+-.        .-+------.        .------+-.
+    | Node 2 +---+ Node 3 |        | Node 2 +--------+ Node 3 |
+    '--------'   '--------'        '--------'        '--------'
+```
+
+---
+
+# NUMA can get pretty complex!
+
+![](lca2016-numa.png)
+
+---
+
+# NUMA Locality
+
+* Use `numactl` to look which CPUs are in which node
+
+```
+    # numactl -H
+    available: 2 nodes (0-1)
+    node 0 cpus: 0 1 2 3 8 9 10 11
+    node 0 size: 24564 MB
+    node 0 free: 17446 MB
+    node 1 cpus: 4 5 6 7 12 13 14 15
+    node 1 size: 24576 MB
+    node 1 free: 21056 MB
+    node distances:
+    node   0   1 
+      0:  10  21 
+      1:  21  10 
+```
+
+* Devices can have NUMA locality too
+* `cat /sys/class/net/$DEV/device/numa_node` for PCIe device locality
+* `-1` means no locality, depends on hardware platform
+
+---
+
+# Bottlenecks
+
+* Where they can occur
+* How to tell
+* How to fix
+
+---
+
+# Bottleneck: Network Interface Receive
+
+* Packet loss before the OS
+* `ethtool --statistics ethX` each vendor's name for "*packet loss*" varies  
+  look for stats like **drop**, **discard**, **buffer**, **fifo**
+* `xsos --net` has a handy grep for common driver discards
+* Friends don't let friends use `ifconfig` (or any of the old `net-tools`)
+    * Counters are not always reliable
+
+Reasons receive loss can occur:
+
+* Poor Interrupt Handling
+* Ring Buffer Overflows
+* Lack of Offloading
+* Kernel not picking traffic fast enough
+* Ethernet Flow Control (aka Pause Frames)
+
+---
+
+# Poor Interrupt Handling
+
+* `/proc/interrupts`
+* An array of CPU cores and interrupt channels
+* Look for spread load, or CPU0 will starve and miss interrupts
+* Bad example, all interrupts on Core 0:
+
+```
+$ egrep "CPU|eth0" /proc/interrupts
+           CPU0       CPU1       CPU2       CPU3       
+ 25:      59285          0          0          0     PCI-MSI-edge    eth0-rx1
+ 26:      45160          0          0          0     PCI-MSI-edge    eth0-rx2
+ 27:      91343          0          0          0     PCI-MSI-edge    eth0-rx3
+ 28:      38452          0          0          0     PCI-MSI-edge    eth0-rx4
+```
+
+---
+
+# Interrupts: Balancing
+
+* Use `irqbalance 1.0.8` or later (need commit [`180cf09`](https://github.com/Irqbalance/irqbalance/commit/180cf09ef5fb4f6479cb232b79abd6f6f3e6eea4))
+* Or balance manually, echo a bitmask into `/proc/irq/$IRQ/smp_affinity`
+* Balance NIC IRQs within the device-local node, or all within the same node
+* Good example, Interrupts spread across CPUs in the one Node:
+
+```
+$ egrep "CPU|eth0" /proc/interrupts
+
+           CPU0       CPU1       CPU2       CPU3       
+ 25:      59285          0          0          0     PCI-MSI-edge    eth0-rx1
+ 26:          0      45160          0          0     PCI-MSI-edge    eth0-rx2
+ 27:          0          0      91343          0     PCI-MSI-edge    eth0-rx3
+ 28:          0          0          0      38452     PCI-MSI-edge    eth0-rx4
+```
+
+---
+
+# Interrupts: Queues
+
+* Modern network interfaces have more than one receive queue, the number of queues is normally configurable
+* Ideally have one queue per CPU (within the NUMA Node)
+* `ethtool --set-channels $DEV [channel type] N` or module option
+* Good, one queue per CPU, within the one Node:
+
+```
+     NUMA Node 0            |  NUMA Node 1
+    ======================= | ======================= 
+    eth0-Rx1  ---->  CPU 0  |  CPU 4
+    eth0-Rx2  ---->  CPU 1  |  CPU 5
+    eth0-Rx3  ---->  CPU 2  |  CPU 6
+    eth0-Rx4  ---->  CPU 3  |  CPU 7
+```
+
+---
+
+# Interrupts: Queues
+
+* Bad, inter-node interrupt spread:
+
+```
+     NUMA Node 0            |  NUMA Node 1
+    ======================= | ======================= 
+    eth0-Rx1  ---->  CPU 0  |  CPU 4  <----  eth0-Rx2
+    eth0-Rx2  ---->  CPU 1  |  CPU 5  <----  eth0-Rx3
+                     CPU 2  |  CPU 6
+                     CPU 3  |  CPU 7
+```
+
+---
+
+# Interrupts: Queues
+
+* Bad, too many queues overwhelming each core:
+
+```
+     NUMA Node 0            |  NUMA Node 1
+    ======================= | ======================= 
+    eth0-Rx1  }             |
+    eth0-Rx2  }---->  CPU 0 |  CPU 4
+    eth0-Rx3  }             |
+                            |
+    eth0-Rx4  }             |
+    eth0-Rx5  }---->  CPU 1 |  CPU 5
+    eth0-Rx6  }             |
+                            |
+    eth0-Rx7  }             |
+    eth0-Rx8  }---->  CPU 2 |  CPU 6
+    eth0-Rx9  }             |
+                            |
+    eth0-Rx10 }             |
+    eth0-Rx11 }---->  CPU 3 |  CPU 7
+    eth0-Rx12 }             |
+```
+
+---
+
+# Receive Ring Buffers
+
+* Traffic storage in hardware until the kernel picks it up
+* Often needed to cope with large throughput spikes
+* Usually set as large as possible, but max 4096
+* `ethtool --set-ring $DEV rx N tx N`
+
+```
+    # ethtool --show-ring eth0
+
+    Ring parameters for eth0:
+    Pre-set maximums:
+    RX:             4096
+    TX:             4096
+    Current hardware settings:
+    RX:             256
+    TX:             256
+```
+
+* (Note: Emulex OneConnect `be2net` doesn't work this way)
+
+---
+
+# Offloading
+
+* The NIC doing some work in hardware, instead of the kernel in software
+* Recv offloading is not suitable for IP forwarding (routing or virt bridges)
+* Otherwise we usually want these **on**
+* If offloading doesn't work, complain to the vendor!
+* `ethtool --offload $DEV $FEATURE on`
+
+```
+    # ethtool --show-features eth0
+
+    Features for eth0:
+    rx-checksumming: on
+    tx-checksumming: on
+    scatter-gather: on
+    tcp-segmentation-offload: on
+    udp-fragmentation-offload: off [fixed]
+    generic-segmentation-offload: on        ** these two are actually
+    generic-receive-offload: on             ** in-kernel emulations
+    large-receive-offload: off
+    ...more lines...
+```
+
+---
+
+# Kernel Not Picking Traffic
+
+* SoftIRQ not running enough
+* `/proc/net/softnet_stat`
+* One line per CPU
+* 1st column - total number of packets received
+* 2nd column - backlog overruns (rare)
+* 3rd column - SoftIRQ ended with traffic left in the NIC
+* `net.core.netdev_budget = 300` kernel tunable can be *slightly* increased
+* Probably don't set budget into the thousands, SoftIRQ can hog the CPU
+
+```
+    $ cat /proc/net/softnet_stat
+
+    00019355 00000000 00000000 ...
+    00012c22 00000000 00000000 ...
+```
+
+---
+
+# Bottleneck: Protocol Layers
+
+* `netstat -s`
+* **collapsed** - under socket buffer memory pressure, but no loss yet
+* **pruned** - incoming data was lost due to lack of socket buffer memory
+* Many of these stats are *symptoms* of packet loss, not *causes*:
+    * **retransmit**, **slow start**, **congestion**, **SACK**
+
+```
+    # netstat -s
+
+    121093641 segments retransmited
+    120 packets pruned from receive queue because of socket buffer overrun
+    685394 packets collapsed in receive queue due to low socket buffer
+
+    1804 times recovered from packet loss due to fast retransmit
+    54444 congestion windows fully recovered
+    45760872 fast retransmits
+    23208494 retransmits in slow start
+```
+
+---
+
+# Socket Buffers - TCP
+
+* `/etc/sysctl.conf`
+```
+    net.ipv4.tcp_rmem = 4096 262144 16777216
+    net.ipv4.tcp_wmem = 4096 262144 16777216
+```
+* These stats are: **min  default  max**
+* Set a sensible default, either vendor default or 256 KiB
+* The kernel will auto-tune the actual buffer size
+* If the app sets its own buffer size, kernel auto-tuning is disabled!
+* `strace` and look for `setsockopt(SO_RCVBUF)` or `setsockopt(SO_SNDBUF)`
+* Why a *sensible* default is important: <https://blog.cloudflare.com/the-story-of-one-latency-spike/>
+
+---
+
+# Socket Buffers - Not TCP
+
+* `/etc/sysctl.conf`
+
+```
+    net.core.rmem_max = 16777216
+    net.core.wmem_max = 16777216
+    net.core.rmem_default = 262144
+    net.core.wmem_default = 262144
+```
+* Applies to **everything not TCP** so don't make these huge!
+* Sensible default, vendor default, 256 KiB
+* Note: the max here will still restrict the TCP max
+
+---
+
+# TCP Timestamps
+
+* Precise calculation of when traffic was transmitted and received
+    * Allows for better auto-tuning of buffers and accurate TCP Windowing
+* Provides `P`rotection `A`gainst `W`rapped `S`equence Numbers (PAWS)
+    * Sequence Numbers are 32-bit, and wrap in 1.8s at 10Gbps
+    * A TCP stream can hang on wrap!
+* Definitely **on**: `net.ipv4.tcp_timestamps = 1`
+* (not compatible with NAT, as multiple hosts have different uptimes)
+
+---
+
+# TCP Selective Acknowledgements
+
+* Traditional retransmit: "*I missed from here onwards, resend it all*"
+* SACK retransmit: "*I only missed this part*"
+* Some people think the SACK calculation has greater overhead than the problem it solves - if you have **no** packet loss, this may be true
+* Test with your specific usage, watch metrics and CPU usage
+* Set **on**: `net.ipv4.tcp_sack = 1`
+
+---
+
+# Bottleneck: Application
+
+* Dropping incoming connections
+* Dropping incoming data
+* Running on the wrong CPU or memory allocation in the wrong place
+
+---
+
+# Application: TCP Listen Backlog
+
+* Not accepting new connections fast enough
+* Also just too many valid incoming connections
+* `netstat -s` for **LISTEN backlog**
+* syslog for **SYN cookies**
+
+Listen backlog is how many un-handshaken TCP sessions before `accept()`
+
+* `net.core.somaxconn = N` (default `128`)
+* Just a kernel-permitted maximum, requires an app change as well
+    * C - `int listen(int sockfd, int backlog)`
+    * Java - `ServerSocket(int port, int backlog)`
+    * httpd - `ListenBacklog $VALUE`
+
+---
+
+# Application: Not Receiving Data
+
+* Not draining socket recieve buffers fast enough
+* `netstat -s` for **collapsed**, **pruned**
+* `ss` for sockets with data in **Recv-Q** for a long time
+* (one sample with data in Recv-Q is ok)
+
+```
+    121093641 segments retransmited
+    120 packets pruned from receive queue because of socket buffer overrun
+    685394 packets collapsed in receive queue due to low socket buffer
+
+
+    $ ss -npt
+    State  Recv-Q  Send-Q  Local Address:Port   Peer Address:Port
+    ESTAB  4572    0       192.168.1.101:46177  192.168.1.102:80
+       users:(("firefox",pid=20988,fd=53))
+```
+
+* Debug the app to dind out what it's doing
+
+---
+
+# Application: NUMA Affinity
+
+* Try to run an application and its related SoftIRQs on the same CPU cores
+* Definitely keep an app and its NIC within the same NUMA Node!
+* `numactl` can keep CPU pinning and memory allocation within a Node
+* `numad` can be taught to automatically manage this
+
+````
+    +----------------+----------------+
+    |                |                |
+    | Node 0         | Node 1         |
+    |                |                |
+    | NIC            | Other Stuff    |
+    | Application    |                |
+    |                |                |
+    +----------------+----------------+
+````
+
+---
+
+# FIN
+
+* Thanks to
+    * Jon Maxwell
+    * Paul Wayper
+    </textarea>
+    <script src="remark-latest.min.js"></script>
+    <script>var slideshow = remark.create({ ratio: '4:3' });</script>
+  </body>
+</html>
