@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Network Performance Tuning</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+
+      .remark-inline-code {
+        padding: 1px!important;
+        padding-left: 3px!important;
+        padding-right: 3px!important;
+        border-radius: 3px!important;
+        border: 1px solid #ccc!important;
+      }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+class: center, middle
+
+# Network Performance Tuning Extras
+
+Jamie Bainbridge  
+ 
+Senior Software Maintenance Engineer  
+
+Red Hat, Inc.  
+
+---
+
+# Additional
+
+Messy scratch notes of things I didn't have time to cover
+
+Feel free to chat to me if you'd like to know more!
+
+---
+
+## TCP Advanced Window Scaling
+
+* How much of total socket buffer to advertise in TCP Window ([`ip-sysctl.txt`](http://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt))
+    * If positive: `bytes/2^tcp_adv_win_scale`
+    * If negative: `bytes-bytes/2^(-tcp_adv_win_scale)`
+* `net.ipv4.tcp_adv_win_scale = 1`
+    * i.e. *reserve half the socket buffer for overhead*
+
+---
+
+## Socket Buffers: UDP
+
+* Sensible minimum
+* `net.ipv4.udp_[rw]mem_min = 4096`
+
+---
+
+## Interrupts: Interrupt Coalescence
+
+* Threshold for when the NIC generates a hard interrupt on recv
+* Tradeoff between latency and interrupts
+* Measured in microseconds (usecs)
+* `ethtool --coalesce $DEV rx-usecs N rx-frames N`
+
+---
+
+## Receive and Transmit Scaling
+
+* RSS: Receive Side Scaling (hardware-controlled balancing)
+* RPS: Receive Packet Steering (software-controlled balancing)
+* RFS: Receive Flow Scaling (application-aware software balancing)
+* XPS: Transmit Packet Steering (software selection of transmit queue)
+* <https://www.kernel.org/doc/Documentation/networking/scaling.txt>
+
+---
+
+# Ethernet Flow Control (aka Pause Frames)
+
+* Lets the NIC tell the switch to buffer traffic
+* Lets the switch tell the NIC to buffer traffic
+* Pause Frames are generated when a watermark in the ring buffer is hit
+* A bit of a tradeoff, as it's per-port not per-queue, so one full recv queue generates a pause frame which stops **all** traffic
+* Try with this **on** first, test with it **off**
+* `ethtool --pause $DEV autoneg on rx on tx on`
+
+```
+    # ethtool p128p1
+    Settings for p128p1:
+            Supported pause frame use: Symmetric Receive-only
+            Advertised pause frame use: Symmetric Receive-only
+```
+
+---
+
+# How Transmit Works
+
+```
+ From App         Protocols           Kernel          NIC
++--------+       +-----------+       +---------+       +----------+---+
+| Socket | ----> | TCP/UDP   | ----> | qdisc   | ----> |  (    )  | P |
+| Buffer |       | SCTP      |       |         |       | ( ring ) | H |
++--------+       |           |       | SoftIRQ |       |  (    )  | Y |
+                 | IP/ICMP   |       +---------+       +----------+---+
+                 |           |
+                 | Ethernet  |
+                 +-----------+
+```
+* Data payload is placed in **Socket Buffer** by app `send()`
+* **Protocol Handlers** are run by the kernel to build the packet
+* The **order** and **amount** of packets able to be submitted for transmit is controlled by the interface's **queueing discipline**
+* **SoftIRQ** uses device-specific code to send queued traffic to the hardware **Ring Buffer**
+
+---
+
+# Bottleneck: Network Interface Transmit
+
+* Packet loss before the OS hands to the NIC
+* `tc -s qdisc` to view qdisc **dropped**
+
+and
+
+* Packet loss after the OS hands to the NIC
+* `ethtool -S ethX` and `xsos --net` again
+
+Reasons transmit loss can occur:
+
+* Insufficient length of queue
+* Transmit ring buffer in hardware too small
+* If you must drop, you can decide what to drop
+
+---
+
+# Transmit Queue Length
+
+* Amount of packets to buffer before sending to the NIC
+* Can be enlarged a little for bulk transfer
+* (can also be reduced for super-low latency, less than 10ms)
+* `ip link set $DEV txqueuelen N` (default `500` to `1000`)
+* Virtual devices (bond, VLAN, tun) don't have a queue, you can add one
+
+```
+    $ ip addr show eth0
+    2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>  qdisc pfifo_fast qlen 1000
+```
+
+* Queuing Disciplines allows prioritization and bandwidth restriction
+* <http://lartc.org/howto/lartc.qdisc.html>
+
+---
+
+# TCP Timestamps
+
+* RFC-1323 says *"a monotonically increasing counter"*
+    * Linux implementation is *"milliseconds since system boot"*
+
+---
+
+# Socket Buffers - System Memory
+
+* Do you actually have enough RAM to service requests?
+* eg: 256 KiB x 100,000 sockets = 24 GiB
+
+For TCP, we have a tunable for this:
+
+* `/etc/sysctl.conf`
+
+```
+    net.ipv4.tcp_mem = 262144  524288  1048576
+                        1 GiB   2 GiB    4 GiB
+```
+
+* Measured in **memory pages** (4 KiB on AMD64)
+* 1st number - Below this, don't moderate TCP memory usage
+* 2nd number - Start to moderate TCP memory usage
+* 3rd number - Max system-wide TCP memory usage
+
+---
+
+# Application: CPU Affinity
+
+* Look at **siblings** from `/proc/cpuinfo` (on AMD64)
+* CPUs can have complex cache affinities, just one example:
+
+```
+     ---------------------------
+    | CPU0 | CPU1 | CPU2 | CPU3 |
+    |------+------+------+------|
+    |  L1  |  L1  |  L1  |  L1  |
+    |------+------+------+------|
+    |     L2      |     L2      |
+    |-------------+-------------|
+    |            L3             |
+     ---------------------------
+```
+
+---
+
+# Application: Design
+
+* The C10K problem gave us good design lessons, these days we are more concerned with C1M but the same theory still mostly applies: <http://www.kegel.com/c10k.html>
+    * Many clients with each task
+    * One client per task
+
+* `SO_REUSEPORT` in kernel v3.9 or later can provide in-kernel listen balancing to multiple tasks: <https://lwn.net/Articles/542629/>
+
+* Multiple **multicast** tasks reading the same socket leads to packet duplication, probably won't scale past four tasks
+
+* If possible, design so there is one RX handler, use IPC to distribute data
+
+---
+
+# FIN
+    </textarea>
+    <script src="remark-latest.min.js"></script>
+    <script>var slideshow = remark.create({ ratio: '4:3' });</script>
+  </body>
+</html>
